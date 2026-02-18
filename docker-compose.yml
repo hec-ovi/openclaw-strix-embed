@@ -1,0 +1,17 @@
+services:
+  embeddings:
+    build: .
+    image: openclaw-embeddings:latest
+    container_name: openclaw-embeddings
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "${EMBEDDING_PORT:-8484}:80"
+    volumes:
+      - ./data:/data
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.5.1
+      - HIP_VISIBLE_DEVICES=0
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-m3}
+      - MODEL_CACHE=/data/models
+    ipc: host

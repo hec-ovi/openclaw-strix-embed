@@ -1,0 +1,493 @@
+# OpenClaw Embeddings — Complete Reference
+
+Local, GPU-accelerated, OpenAI-compatible embeddings API. Replaces paid embedding services (OpenAI, Google, Cohere) with a self-hosted solution running on AMD Strix Halo via ROCm.
+
+Single Docker service: FastAPI server + sentence-transformers + PyTorch ROCm. No external dependencies at runtime.
+
+## Problem Solved
+
+RAG pipelines and vector databases need an embeddings endpoint. The standard options:
+- OpenAI `text-embedding-3-small` — $0.02/1M tokens, data leaves your network
+- Google `text-embedding-004` — $0.00025/1K chars, data leaves your network
+- Cohere `embed-v4.0` — $0.10/1M tokens, data leaves your network
+
+This provides the same OpenAI-compatible API (`POST /v1/embeddings`) running locally on your own GPU, with zero cost per request and zero data leaving your machine.
+
+Additional challenge: Standard ROCm containers fail on Strix Halo (gfx1151) because:
+1. Stable ROCm wheels don't include gfx1151 — only prerelease wheels do
+2. Ubuntu Rolling ships Python 3.13, but ROCm gfx1151 wheels target Python 3.12
+3. pip silently falls back to CPU-only wheels when GPU wheels aren't found
+
+Solution: Same pattern as [rocm-strix-docker](https://github.com/hec-ovi/rocm-strix-docker) — Ubuntu Rolling + UV with Python 3.12 venv + AMD prerelease wheels.
+
+## Verified Versions (tested Feb 2026)
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| Ubuntu (base image) | 25.10 (rolling) | `ubuntu:rolling` |
+| Python | 3.12 | Installed by UV, bypasses system Python 3.13 |
+| UV | latest | From `ghcr.io/astral-sh/uv:latest` |
+| PyTorch | 2.9.1+rocm7.11.0rc1 | Prerelease gfx1151 wheel |
+| HIP Runtime | 7.2.53150 | `torch.version.hip` |
+| sentence-transformers | latest | HuggingFace sentence-transformers |
+| FastAPI | latest | API framework |
+| Embedding Model | BAAI/bge-m3 | 1024 dims, 100+ languages |
+| GPU | Radeon 8060S | 124.6 GB VRAM reported |
+
+## Project Structure
+
+```
+.
+├── .gitignore              # Ignores .env and data/
+├── .env.template           # Template — copy to .env
+├── README.md               # User-facing documentation
+├── llm.txt                 # This complete technical reference
+├── Dockerfile              # Ubuntu Rolling + ROCm PyTorch + FastAPI
+├── docker-compose.yml      # Service definition with GPU passthrough
+├── entrypoint.sh           # GPU check + uvicorn start
+├── server.py               # OpenAI-compatible FastAPI server
+└── data/                   # Persistent model cache (git-ignored)
+    └── models/             # HuggingFace model files (~4.3 GB)
+```
+
+## .gitignore
+
+```
+.env
+data/
+```
+
+Two entries:
+- `.env` — machine-specific config (port, model choice). The `.env.template` IS committed.
+- `data/` — model cache. Large binary files (~4.3 GB) that should never be in git. Downloaded automatically on first start.
+
+## .env.template
+
+```
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_PORT=8484
+```
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `EMBEDDING_MODEL` | No | `BAAI/bge-m3` | HuggingFace model ID. Any sentence-transformers compatible model works. |
+| `EMBEDDING_PORT` | No | `8484` | Host port the API is exposed on. |
+
+## Core Files — Exact Content
+
+### Dockerfile
+
+```dockerfile
+# =============================================================================
+# OpenClaw Embeddings — Local OpenAI-compatible Embeddings API
+# =============================================================================
+# Base: Ubuntu Rolling + ROCm PyTorch (gfx1151 / Strix Halo)
+# Features: FastAPI server with /v1/embeddings endpoint, GPU-accelerated
+
+FROM ubuntu:rolling
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_CACHE_DIR=/root/.cache/uv
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV HSA_OVERRIDE_GFX_VERSION=11.5.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    libgl1 libglib2.0-0 libgomp1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# PyTorch ROCm gfx1151 from AMD prerelease index + embedding dependencies
+RUN uv venv .venv --python 3.12 && \
+    uv pip install --pre \
+    torch torchvision \
+    --index-url https://rocm.prereleases.amd.com/whl/gfx1151/ && \
+    uv pip install \
+    sentence-transformers \
+    fastapi \
+    uvicorn[standard]
+
+COPY server.py /app/server.py
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:80/health')" || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
+```
+
+Key decisions:
+- **Two-phase install**: PyTorch ROCm wheels from AMD prerelease index first (needs `--pre` + `--index-url`), then sentence-transformers/FastAPI from PyPI (standard index). Can't mix `--index-url` across both in one command.
+- **`ubuntu:rolling`**: Matches rocm-strix-docker for kernel/driver compatibility.
+- **`uv venv .venv --python 3.12`**: UV installs Python 3.12 into the venv, bypassing system Python 3.13.
+- **`HSA_OVERRIDE_GFX_VERSION=11.5.1`**: Baked into image so ROCm recognizes Strix Halo.
+- **HEALTHCHECK**: 120s start period — model download on first start can take minutes.
+- **No pip**: UV handles everything.
+
+### entrypoint.sh
+
+```bash
+#!/bin/bash
+set -e
+
+# =============================================================================
+# OpenClaw Embeddings — Entrypoint
+# =============================================================================
+# 1. Check GPU availability
+# 2. Start uvicorn (model downloads on first request if not cached)
+
+MODEL="${EMBEDDING_MODEL:-BAAI/bge-m3}"
+
+log() {
+    echo "[embeddings] $1"
+}
+
+log "========================================"
+log "Model: $MODEL"
+log "========================================"
+
+if [ -z "$HSA_OVERRIDE_GFX_VERSION" ]; then
+    export HSA_OVERRIDE_GFX_VERSION=11.5.1
+fi
+
+log "Checking GPU..."
+python3 -c "
+import torch
+if torch.cuda.is_available():
+    print(f'[embeddings] GPU: {torch.cuda.get_device_name(0)}')
+    print(f'[embeddings] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+    print(f'[embeddings] ROCm/HIP: {torch.version.hip}')
+    print(f'[embeddings] Device: cuda')
+else:
+    print('[embeddings] WARNING: No GPU detected, falling back to CPU')
+    print('[embeddings] Device: cpu')
+"
+
+log "Starting server on port 80..."
+exec uvicorn server:app --host 0.0.0.0 --port 80 --workers 1
+```
+
+Flow: prints model name, checks GPU via PyTorch, starts uvicorn. Does NOT exit on missing GPU — falls back to CPU gracefully (unlike rocm-strix-docker which exits on GPU failure). Model download happens inside FastAPI's startup event, not in the entrypoint.
+
+### server.py
+
+```python
+"""OpenAI-compatible Embeddings API server for BAAI/bge-m3."""
+
+import time
+import os
+import torch
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+
+MODEL_ID = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
+CACHE_DIR = os.environ.get("MODEL_CACHE", "/data/models")
+
+app = FastAPI(title="OpenClaw Embeddings")
+
+model: SentenceTransformer = None
+
+
+@app.on_event("startup")
+def load_model():
+    global model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[embeddings] Loading {MODEL_ID} on {device}")
+    if torch.cuda.is_available():
+        print(f"[embeddings] GPU: {torch.cuda.get_device_name(0)}")
+    model = SentenceTransformer(MODEL_ID, cache_folder=CACHE_DIR, device=device)
+    print(f"[embeddings] Model loaded. Dimension: {model.get_sentence_embedding_dimension()}")
+
+
+class EmbeddingRequest(BaseModel):
+    model: str = MODEL_ID
+    input: str | list[str]
+    encoding_format: str = "float"
+
+
+class EmbeddingData(BaseModel):
+    object: str = "embedding"
+    index: int
+    embedding: list[float]
+
+
+class EmbeddingResponse(BaseModel):
+    object: str = "list"
+    data: list[EmbeddingData]
+    model: str
+    usage: dict
+
+
+@app.post("/v1/embeddings")
+def create_embeddings(req: EmbeddingRequest):
+    if model is None:
+        raise HTTPException(503, "Model not loaded yet")
+
+    texts = [req.input] if isinstance(req.input, str) else req.input
+
+    embeddings = model.encode(texts, normalize_embeddings=True)
+
+    data = []
+    total_tokens = 0
+    for i, emb in enumerate(embeddings):
+        data.append(EmbeddingData(
+            index=i,
+            embedding=emb.tolist(),
+        ))
+        total_tokens += len(texts[i].split())
+
+    return EmbeddingResponse(
+        data=data,
+        model=MODEL_ID,
+        usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+    )
+
+
+@app.get("/v1/models")
+def list_models():
+    dim = model.get_sentence_embedding_dimension() if model else 0
+    return {
+        "object": "list",
+        "data": [{
+            "id": MODEL_ID,
+            "object": "model",
+            "owned_by": "local",
+            "meta": {"dimension": dim},
+        }],
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": model is not None}
+```
+
+Key details:
+- **`normalize_embeddings=True`**: L2-normalized vectors — required for cosine similarity search.
+- **`cache_folder=CACHE_DIR`**: Points to `/data/models` inside the container, which is volume-mounted to `./data/models` on the host.
+- **Startup event**: Model loads once on server start. First start downloads from HuggingFace; subsequent starts load from cache.
+- **Token counting**: Approximate (word split). Matches OpenAI response format but isn't tokenizer-accurate — sufficient for usage tracking.
+- **Batch support**: `input` accepts string or array of strings.
+
+### docker-compose.yml
+
+```yaml
+services:
+  embeddings:
+    build: .
+    image: openclaw-embeddings:latest
+    container_name: openclaw-embeddings
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "${EMBEDDING_PORT:-8484}:80"
+    volumes:
+      - ./data:/data
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.5.1
+      - HIP_VISIBLE_DEVICES=0
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-m3}
+      - MODEL_CACHE=/data/models
+    ipc: host
+```
+
+- **`privileged: true`**: Full device access for `/dev/kfd` and `/dev/dri`. Required for ROCm GPU compute.
+- **`ipc: host`**: Shared memory for PyTorch.
+- **`./data:/data`**: Persistent model cache. Survives container rebuilds.
+- **`MODEL_CACHE=/data/models`**: Tells sentence-transformers where to store/load models inside the container.
+- **`HIP_VISIBLE_DEVICES=0`**: Limits to the first GPU.
+- **Port**: Configurable via `.env`, defaults to 8484.
+
+## API Contract
+
+### POST /v1/embeddings
+
+OpenAI-compatible endpoint. Any client library (LangChain, LlamaIndex, OpenAI SDK with `base_url` override) works.
+
+**Request:**
+```json
+{
+  "model": "BAAI/bge-m3",
+  "input": "text to embed"
+}
+```
+
+Or batch:
+```json
+{
+  "model": "BAAI/bge-m3",
+  "input": ["text one", "text two", "text three"]
+}
+```
+
+**Response:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.0123, -0.044, ...]
+    }
+  ],
+  "model": "BAAI/bge-m3",
+  "usage": {"prompt_tokens": 3, "total_tokens": 3}
+}
+```
+
+### GET /v1/models
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "BAAI/bge-m3",
+      "object": "model",
+      "owned_by": "local",
+      "meta": {"dimension": 1024}
+    }
+  ]
+}
+```
+
+### GET /health
+
+```json
+{"status": "ok", "model_loaded": true}
+```
+
+## Using with Multipass VMs
+
+When OpenClaw runs inside a Multipass VM, `localhost` inside the VM refers to the VM itself, not the host where this embeddings service runs.
+
+### Find the host IP
+
+Multipass creates a bridge interface (`mpqemubr0`) for VM networking. The host's IP on this bridge is what the VM can reach:
+
+```bash
+# On the host
+ip addr show mpqemubr0 | grep 'inet '
+# Output: inet 10.5.162.1/24 brd 10.5.162.255 scope global mpqemubr0
+```
+
+The host IP is `10.5.162.1` in this example.
+
+### Verify connectivity from the VM
+
+```bash
+multipass exec openclaw -- curl -s http://10.5.162.1:8484/health
+# Expected: {"status":"ok","model_loaded":true}
+
+multipass exec openclaw -- curl -s http://10.5.162.1:8484/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"BAAI/bge-m3","input":"connectivity test"}'
+```
+
+### Configure OpenClaw
+
+| Setting | Value |
+|---------|-------|
+| Embeddings Base URL | `http://10.5.162.1:8484/v1` |
+| Embeddings Model | `BAAI/bge-m3` |
+| Auth | None |
+
+Replace `10.5.162.1` with whatever your `mpqemubr0` interface shows.
+
+## Build & Run
+
+```bash
+cp .env.template .env
+# Optionally edit .env to change model or port
+
+docker compose up -d --build
+docker logs openclaw-embeddings
+```
+
+First start: downloads model from HuggingFace (~4.3 GB). Takes 1-2 minutes depending on bandwidth.
+Subsequent starts: loads from `./data/models/` cache in ~10 seconds.
+
+### Rebuild after changes
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+Model cache in `./data/` persists across rebuilds — no re-download needed.
+
+## Performance
+
+Tested on AMD Ryzen AI Max (Strix Halo) — Radeon 8060S iGPU:
+
+| Metric | Value |
+|--------|-------|
+| Single text latency | ~47ms |
+| First request (cold) | ~270ms |
+| GPU VRAM usage | ~1.5 GB |
+| Model load (from cache) | ~10s |
+| Model dimensions | 1024 |
+
+CPU fallback works but is 5-10x slower (~200-500ms per request).
+
+## Verified Output
+
+### Container Startup
+```
+[embeddings] ========================================
+[embeddings] Model: BAAI/bge-m3
+[embeddings] ========================================
+[embeddings] Checking GPU...
+[embeddings] GPU: Radeon 8060S Graphics
+[embeddings] VRAM: 124.6 GB
+[embeddings] ROCm/HIP: 7.2.53150-7b886380f9
+[embeddings] Device: cuda
+[embeddings] Starting server on port 80...
+[embeddings] Loading BAAI/bge-m3 on cuda
+[embeddings] GPU: Radeon 8060S Graphics
+[embeddings] Model loaded. Dimension: 1024
+```
+
+### API Test
+```bash
+curl -s http://localhost:8484/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"BAAI/bge-m3","input":"Hola mundo, hello world"}' | python3 -m json.tool
+```
+
+Returns 1024-dimensional float array, ~47ms response time.
+
+## Verification Commands
+
+```bash
+# GPU detection
+docker exec openclaw-embeddings python3 -c "import torch; print(torch.cuda.get_device_name(0))"
+
+# PyTorch version
+docker exec openclaw-embeddings python3 -c "import torch; print(torch.__version__)"
+
+# Health check
+curl -s http://localhost:8484/health
+
+# List models
+curl -s http://localhost:8484/v1/models
+
+# Embedding test
+curl -s http://localhost:8484/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"BAAI/bge-m3","input":"test"}'
+```
+
+## Auth
+
+No authentication. The service binds to the host port and is accessible from the local network. If you need auth, set a reverse proxy (nginx/caddy) in front of it with bearer token validation, or add an `API_KEY` env var and middleware to `server.py`.
