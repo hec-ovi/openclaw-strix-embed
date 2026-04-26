@@ -1,19 +1,36 @@
-# OpenClaw Embeddings
+<h1 align="center">openclaw-strix-embed</h1>
 
-Local, GPU-accelerated, OpenAI-compatible embeddings API. Drop-in replacement for OpenAI's `/v1/embeddings` endpoint — no API keys, no usage fees, no data leaving your network.
+<p align="center">
+  <strong>Local, GPU-accelerated, OpenAI-compatible <code>/v1/embeddings</code> API on AMD Strix Halo. BAAI/bge-m3 by default, no API keys, no fees, no data leaving your network.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Status-Working-brightgreen" alt="Status" />
+  <img src="https://img.shields.io/badge/AMD-Strix_Halo-ED1C24?logo=amd&logoColor=white" alt="AMD Strix Halo" />
+  <img src="https://img.shields.io/badge/ROCm-7.x-EF5B25?logo=amd&logoColor=white" alt="ROCm" />
+  <img src="https://img.shields.io/badge/Model-BAAI/bge--m3-7B3FA0" alt="Model" />
+  <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/License-MIT-blue" alt="License" />
+</p>
+
+---
+
+## What this is
+
+Local, GPU-accelerated, OpenAI-compatible embeddings API. Drop-in replacement for OpenAI's `/v1/embeddings` endpoint, no API keys, no usage fees, no data leaving your network.
 
 Built for AMD Strix Halo (RDNA 3.5 / gfx1151) with ROCm, but falls back to CPU if no GPU is available.
 
 ## Why
 
-Every vector database and RAG pipeline needs an embeddings API. The standard options — OpenAI `text-embedding-3-small`, Google `text-embedding-004` — charge per token and send your data to external servers. This runs the same API contract locally, for free, on your own hardware.
+Every vector database and RAG pipeline needs an embeddings API. The standard options, OpenAI `text-embedding-3-small`, Google `text-embedding-004`, charge per token and send your data to external servers. This runs the same API contract locally, for free, on your own hardware.
 
 ## Project Structure
 
 ```
 .
 ├── .gitignore              # Ignores .env and data/
-├── .env.template           # Template — copy to .env
+├── .env.template           # Template, copy to .env
 ├── README.md               # This file
 ├── llm.txt                 # Complete technical reference
 ├── Dockerfile              # Ubuntu Rolling + ROCm PyTorch + FastAPI
@@ -115,7 +132,7 @@ You can swap it for any [sentence-transformers](https://www.sbert.net/) compatib
 
 ## Using with Multipass VMs
 
-If OpenClaw runs inside a Multipass VM and this embeddings service runs on the host, `localhost` won't work — it points to the VM, not the host.
+If OpenClaw runs inside a Multipass VM and this embeddings service runs on the host, `localhost` won't work, it points to the VM, not the host.
 
 **Find the host IP on the Multipass bridge:**
 ```bash
@@ -154,11 +171,17 @@ Tested on AMD Ryzen AI Max (Strix Halo) with Radeon 8060S iGPU:
 
 This container uses the same ROCm setup from [rocm-strix-docker](https://github.com/hec-ovi/rocm-strix-docker):
 
-- **`HSA_OVERRIDE_GFX_VERSION=11.5.1`** — required for ROCm to recognize Strix Halo
-- **`privileged: true`** — grants `/dev/kfd` and `/dev/dri` access for GPU compute
-- **`ipc: host`** — shared memory for PyTorch
+- **`HSA_OVERRIDE_GFX_VERSION=11.5.1`**, required for ROCm to recognize Strix Halo
+- **`privileged: true`**, grants `/dev/kfd` and `/dev/dri` access for GPU compute
+- **`ipc: host`**, shared memory for PyTorch
 - **PyTorch wheels** from `https://rocm.prereleases.amd.com/whl/gfx1151/` (ROCm 7.11 prerelease)
 - **UV** manages Python 3.12 + all packages (no pip)
+
+---
+
+## License
+
+[MIT](LICENSE) for original code in this repository (FastAPI server, Dockerfile, Compose configs, scripts). Third-party model weights (BAAI/bge-m3) and runtimes (sentence-transformers, transformers, PyTorch ROCm) retain their own upstream licenses; this repository does not redistribute them.
 
 ## Verified Output
 
